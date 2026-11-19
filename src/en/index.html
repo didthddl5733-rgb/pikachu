@@ -92,7 +92,7 @@
           <a href="./update-history/" target="_self">Update history</a>
         </p>
       </div>
-      <div class="margin-top">
+      <div id="settings-block" class="margin-top">
         <div>
           <img
             class="screenshot"
@@ -283,7 +283,7 @@
             /><label for="taiwan">Taiwan</label>
           </div>
         </div>
-        <div>
+        <div id="nickname-block">
           <p class="margin-top">
             <span class="thick">Nickname:</span> You can set your nickname
             below. (The default nickname is "Player".)<br />
@@ -314,7 +314,7 @@
       <div id="lobby-container" class="margin-top">
         <p class="no-margin-top"><span class="thick">Open rooms</span></p>
         <ul id="lobby-list"></ul>
-        <div id="lobby-empty">No open rooms. Create one with "With your friend" → "Create a room".</div>
+        <div id="lobby-empty">No open rooms. Tap "Create a room" above to make one.</div>
         <span id="lobby-join-text" class="hidden">Join</span>
       </div>
       <div class="margin-top grid-1-1">
@@ -398,7 +398,7 @@
           </table>
         </details>
       </div>
-      <div id="about-with-your-friend" class="margin-top hidden">
+      <div id="about-with-your-friend" class="margin-top">
         <div>
           <p class="no-margin-top">
             <span class="thick"
@@ -436,6 +436,7 @@
           <input
             type="text"
             id="join-room-id-input"
+            placeholder="Join by room ID"
             maxlength="30"
             autocapitalize="none"
             autocomplete="off"
@@ -449,6 +450,12 @@
           </p>
           <div id="connection-log-with-friend" class="pre-wrap"></div>
         </div>
+      </div>
+      <div id="mini-footer">
+        Original Pikachu Volleyball: 1997 (C) SACHI SOFT / SAWAYAKAN
+        Programmers, Satoshi Takenouchi<br />
+        P2P online version:
+        <a href="https://github.com/gorisanson/pikachu-volleyball-p2p-online" target="_blank" rel="noopener">gorisanson</a>
       </div>
       <div
         id="press-enter-to-quick-match"

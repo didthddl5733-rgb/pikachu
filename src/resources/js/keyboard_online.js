@@ -12,7 +12,7 @@ import {
   sendInputQueueToPeer,
 } from './data_channel/data_channel.js';
 import { mod, isInModRange } from './utils/mod.js';
-import { touchInput } from './touch_controls.js';
+import { touchInput, setComboSide } from './touch_controls.js';
 
 /** @constant @type {number} communicated input queue buffer length */
 export const bufferLength = 8;
@@ -115,7 +115,7 @@ class MyKeyboard {
       downRight2
     );
     this._syncCounter = 0;
-    this.touchPowerHitDownPrevious = false;
+    this.touchHitPressCountPrevious = 0;
     /** @type {PikaUserInputWithSync[]} */
     this.inputQueue = [];
   }
@@ -174,17 +174,24 @@ class MyKeyboard {
           ? this.keyboard1.powerHit
           : this.keyboard2.powerHit;
       // touch controls
+      setComboSide(!!channel.amIPlayer2);
       if (xDirection === 0) {
         xDirection = touchInput.xDirection;
       }
       if (yDirection === 0) {
         yDirection = touchInput.yDirection;
       }
-      const touchDown = touchInput.powerHitDown;
-      if (powerHit === 0 && touchDown && !this.touchPowerHitDownPrevious) {
-        powerHit = 1;
+      if (touchInput.comboX !== 0) {
+        // combo forward = toward the opponent
+        xDirection = channel.amIPlayer2 ? -1 : 1;
       }
-      this.touchPowerHitDownPrevious = touchDown;
+      if (touchInput.comboY !== 0) {
+        yDirection = touchInput.comboY;
+      }
+      if (touchInput.hitPressCount !== this.touchHitPressCountPrevious) {
+        powerHit = 1;
+        this.touchHitPressCountPrevious = touchInput.hitPressCount;
+      }
       const userInputWithSync = new PikaUserInputWithSync(
         this.syncCounter,
         xDirection,
