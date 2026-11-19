@@ -9,6 +9,7 @@
  */
 'use strict';
 import { Peer } from 'peerjs';
+import { stopAdvertising, stopLobby } from '../lobby.js';
 import seedrandom from 'seedrandom';
 import { setCustomRng } from '../offline_version_js/rand.js';
 import { mod, isInModRange } from '../utils/mod.js';
@@ -889,6 +890,8 @@ function dataChannelOpened() {
 
   notifyBySound();
   cleanUpFirestoreRelevants();
+  stopAdvertising();
+  stopLobby();
 
   if (channel.isQuickMatch) {
     disableCancelQuickMatchBtnForAWhile();

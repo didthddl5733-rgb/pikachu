@@ -15,6 +15,7 @@ import {
   sendPeerNicknameShownMessageToPeer,
 } from './data_channel/data_channel.js';
 import { generatePushID } from './utils/generate_pushid.js';
+import { advertiseRoom, stopAdvertising, startLobby } from './lobby.js';
 import { myKeyboard } from './keyboard_online.js';
 import { testNetwork } from './data_channel/network_test.js';
 import {
@@ -587,13 +588,6 @@ export function setUpUI() {
     pressEnterToQuickMatch.classList.remove('hidden');
   });
 
-  const clickQuickMatchBtnByPressingEnter = (event) => {
-    if (event.code === 'Enter') {
-      event.preventDefault();
-      window.removeEventListener('keydown', clickQuickMatchBtnByPressingEnter);
-      quickMatchBtn.click();
-    }
-  };
   // Quick match is disabled in this build (no quick match server)
 
   createBtn.addEventListener('click', () => {
@@ -605,6 +599,7 @@ export function setUpUI() {
     const roomId = generatePushID();
     createRoom(roomId).then(() => {
       printCurrentRoomID(roomId);
+      advertiseRoom(roomId, channel.myNickname);
       copyBtn.classList.remove('hidden');
       // @ts-ignore
       exitRoomBtn.disabled = false;
@@ -623,6 +618,7 @@ export function setUpUI() {
   });
 
   exitRoomBtn.addEventListener('click', () => {
+    stopAdvertising();
     cleanUpFirestoreRelevants();
     window.setTimeout(() => location.reload(), 0);
   });
@@ -650,6 +646,8 @@ export function setUpUI() {
       }
     });
   });
+  setUpLobbyList(withYourFriendBtn, joinBtn);
+
   withYourFriendBtn.addEventListener('click', () => {
     const aboutWithYourFriend = document.getElementById(
       'about-with-your-friend'
@@ -782,7 +780,9 @@ export function setUpUI() {
   channel.callbackAfterDataChannelOpenedForUI = () => {
     window.addEventListener('keydown', (event) => {
       if (event.code === 'Space') {
+        // Chat is disabled in this build
         if (
+          channel.isOpen === null &&
           !chatOpenBtnAndChatDisablingBtnContainer.classList.contains('hidden')
         ) {
           event.preventDefault();
@@ -1918,4 +1918,46 @@ function hideSubmenus() {
   for (let i = 0; i < submenuBtns.length; i++) {
     submenuBtns[i].classList.remove('open');
   }
+}
+
+/**
+ * Render the open room list and handle join clicks
+ * @param {HTMLElement} withYourFriendBtn
+ * @param {HTMLElement} joinBtn
+ */
+function setUpLobbyList(withYourFriendBtn, joinBtn) {
+  const listElem = document.getElementById('lobby-list');
+  const emptyElem = document.getElementById('lobby-empty');
+  const joinText = document.getElementById('lobby-join-text').textContent;
+  startLobby((rooms) => {
+    listElem.textContent = '';
+    emptyElem.classList.toggle('hidden', rooms.length > 0);
+    for (const room of rooms) {
+      const li = document.createElement('li');
+      const name = document.createElement('span');
+      name.className = 'lobby-room-name';
+      name.textContent = room.nickname || '?';
+      const btn = document.createElement('button');
+      btn.type = 'button';
+      btn.className = 'lobby-join-btn';
+      btn.textContent = joinText;
+      btn.disabled = joinBtn.disabled;
+      btn.addEventListener('click', () => {
+        if (joinBtn.disabled) {
+          return;
+        }
+        const about = document.getElementById('about-with-your-friend');
+        if (about.classList.contains('hidden')) {
+          withYourFriendBtn.click();
+        }
+        // @ts-ignore
+        document.getElementById('join-room-id-input').value = room.roomId;
+        joinBtn.click();
+        about.scrollIntoView({ behavior: 'smooth' });
+      });
+      li.appendChild(name);
+      li.appendChild(btn);
+      listElem.appendChild(li);
+    }
+  });
 }

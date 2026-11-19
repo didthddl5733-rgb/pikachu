@@ -6,6 +6,8 @@
  * It is achieved by setting the same RNG (random number generator) for each player's chat box.
  */
 'use strict';
+
+const CHAT_DISABLED = true;
 import {
   channel,
   sendChatEnabledMessageToPeer,
@@ -121,6 +123,10 @@ export function displayPeerChatMessage(message) {
 }
 
 export function displayChatMessageAt(message, whichPlayerSide) {
+  // Chat is disabled in this build
+  if (CHAT_DISABLED) {
+    return;
+  }
   if (!channel.myChatEnabled) {
     return;
   }
