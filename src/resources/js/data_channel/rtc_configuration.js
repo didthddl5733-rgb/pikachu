@@ -1,3 +1,5 @@
+import { turnServers } from './turn_config.js';
+
 // This configuration should contain at least two stun servers to test for symmetric nat in test_network.js
 export const rtcConfiguration = {
   iceServers: [
@@ -7,6 +9,10 @@ export const rtcConfiguration = {
     {
       urls: ['stun:stun2.l.google.com:19302'],
     },
+    {
+      urls: ['stun:stun.l.google.com:19302', 'stun:stun.cloudflare.com:3478'],
+    },
+    ...turnServers,
   ],
 };
 

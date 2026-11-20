@@ -8,7 +8,8 @@
  * https://webrtc.org/getting-started/data-channels
  */
 'use strict';
-import { Peer } from 'peerjs';
+import { Signaling } from './mqtt_signaling.js';
+import { turnServers } from './turn_config.js';
 import { stopAdvertising, stopLobby } from '../lobby.js';
 import seedrandom from 'seedrandom';
 import { setCustomRng } from '../offline_version_js/rand.js';
@@ -142,8 +143,9 @@ const peerNicknameShownManager = createMessageSyncManager(8); // use 8, 9 for sy
 let peerConnection = null;
 let dataChannel = null;
 let roomId = null;
-let peer = null;
-let peerDataConn = null;
+let signaling = null;
+let offerRefreshTimer = null;
+let disconnectTimer = null;
 let isDataChannelEverOpened = false;
 let isFirstInputQueueFromPeer = true;
 // first chat message is used for nickname transmission
@@ -151,122 +153,82 @@ let isFirstChatMessageToPeerUsedForNickname = true;
 let isFirstChatMessageFromPeerUsedForNickname = true;
 let isAutoAskingFastWhenBothPeerDoApplied = false;
 
-/**
- * Convert a room ID (20 chars, may contain '-' and '_') to a PeerJS-safe peer ID
- * @param {string} id
- * @return {string}
- */
-function roomIdToPeerId(id) {
-  let hex = '';
-  for (let i = 0; i < id.length; i++) {
-    hex += id.charCodeAt(i).toString(16).padStart(2, '0');
-  }
-  return `pikavb${hex}`;
-}
+const OFFER_MAX_AGE_MS = 60000;
+const OFFER_REFRESH_MS = 20000;
+const DISCONNECT_GRACE_MS = 10000;
 
 /**
- * Attach ICE candidate listener to collect partial public IP (for display)
+ * Wait until ICE gathering completes (or timeout), so the SDP contains candidates.
  * @param {RTCPeerConnection} pc
+ * @param {number} timeoutMs
+ * @return {Promise<void>}
  */
-function watchIceCandidates(pc) {
-  if (!pc) {
-    return;
-  }
-  pc.addEventListener('icecandidate', (event) => {
-    if (!event.candidate || event.candidate.candidate === '') {
+function waitIceGathering(pc, timeoutMs) {
+  return new Promise((resolve) => {
+    if (pc.iceGatheringState === 'complete') {
+      resolve();
       return;
     }
-    const myPublicIP = parsePublicIPFromCandidate(event.candidate.candidate);
-    if (myPublicIP !== null) {
-      channel.myPartialPublicIP = getPartialIP(myPublicIP);
+    const timer = setTimeout(done, timeoutMs);
+    function done() {
+      clearTimeout(timer);
+      pc.removeEventListener('icegatheringstatechange', check);
+      resolve();
     }
+    function check() {
+      if (pc.iceGatheringState === 'complete') {
+        done();
+      }
+    }
+    pc.addEventListener('icegatheringstatechange', check);
   });
 }
 
 /**
- * Use a PeerJS data connection as the game data channel
- * @param {import('peerjs').DataConnection} conn
+ * Get the partial public IP address from candidates in an SDP
+ * @param {string} sdp
+ * @return {string|null}
  */
-function adoptDataConnection(conn) {
-  peerDataConn = conn;
-  peerConnection = conn.peerConnection;
-  registerPeerConnectionListeners(peerConnection, false);
-  conn.on('open', () => {
-    dataChannel = conn.dataChannel;
-    dataChannel.binaryType = 'arraybuffer';
-    dataChannel.addEventListener('message', recieveFromPeer);
-    dataChannel.addEventListener('close', dataChannelClosed);
-    try {
-      peerConnection.getStats().then((stats) => {
-        stats.forEach((report) => {
-          if (report.type === 'remote-candidate' && report.address) {
-            const ip = parsePublicIPFromCandidate(
-              `candidate:0 1 udp 0 ${report.address} 0 typ ${report.candidateType}`
-            );
-            if (ip !== null) {
-              channel.peerPartialPublicIP = getPartialIP(ip);
-            }
-          }
-        });
+function partialPublicIPFromSdp(sdp) {
+  for (const line of sdp.split(/\r?\n/)) {
+    if (line.startsWith('a=candidate:')) {
+      const ip = parsePublicIPFromCandidate(line.slice(2));
+      if (ip !== null) {
+        return getPartialIP(ip);
+      }
+    }
+  }
+  return null;
+}
+
+/**
+ * Log which kind of path the connection uses (direct / relay)
+ * @param {RTCPeerConnection} pc
+ */
+function logSelectedCandidatePair(pc) {
+  pc.getStats()
+    .then((stats) => {
+      stats.forEach((report) => {
+        if (
+          report.type === 'candidate-pair' &&
+          report.state === 'succeeded' &&
+          report.nominated
+        ) {
+          const local = stats.get(report.localCandidateId);
+          const remote = stats.get(report.remoteCandidateId);
+          const msg = `path: ${local ? local.candidateType : '?'} -> ${
+            remote ? remote.candidateType : '?'
+          }`;
+          console.log(msg);
+          printLog(msg);
+        }
       });
-    } catch (e) {
-      console.log(e);
-    }
-    dataChannelOpened();
-  });
-  conn.on('close', () => {
-    if (channel.isOpen) {
-      dataChannelClosed();
-    }
-  });
-  conn.on('error', (err) => {
-    console.log('data connection error', err);
-    printLog(`data connection error: ${err}`);
-  });
+    })
+    .catch(() => {});
 }
 
-/**
- * Create a PeerJS peer object
- * @param {string} [id]
- * @return {Promise<Peer>}
- */
-function createPeer(id) {
-  return new Promise((resolve, reject) => {
-    /** @type {Object} */
-    const options = { config: rtcConfiguration, debug: 1 };
-    // Optional self-hosted PeerJS server: ?signal=http://host:port
-    const signal = new URLSearchParams(window.location.search).get('signal');
-    if (signal) {
-      try {
-        const u = new URL(signal);
-        options.host = u.hostname;
-        options.port = Number(u.port) || (u.protocol === 'https:' ? 443 : 80);
-        options.secure = u.protocol === 'https:';
-        options.path = u.pathname === '/' ? '/' : u.pathname;
-      } catch (e) {
-        console.log('invalid signal param', e);
-      }
-    }
-    const p = id ? new Peer(id, options) : new Peer(options);
-    let settled = false;
-    p.on('open', () => {
-      settled = true;
-      resolve(p);
-    });
-    p.on('error', (err) => {
-      console.log('peer error', err.type, err);
-      printLog(`peer error: ${err.type}`);
-      if (!settled) {
-        settled = true;
-        reject(err);
-      } else if (err.type === 'peer-unavailable') {
-        printNoRoomMatchingMessage();
-      } else if (!isDataChannelEverOpened && err.type !== 'disconnected') {
-        notifyBySound();
-        printConnectionFailed();
-      }
-    });
-  });
+function iceGatherTimeout() {
+  return turnServers.length > 0 ? 4000 : 2500;
 }
 
 /**
@@ -276,25 +238,90 @@ function createPeer(id) {
 export async function createRoom(roomIdToCreate) {
   channel.amICreatedRoom = true;
   roomId = roomIdToCreate;
-  try {
-    peer = await createPeer(roomIdToPeerId(roomId));
-  } catch (err) {
+
+  console.log('Create PeerConnection with configuration: ', rtcConfiguration);
+  peerConnection = new RTCPeerConnection(rtcConfiguration);
+  registerPeerConnectionListeners(peerConnection);
+
+  // Unreliable and unordered (UDP-like) data channel.
+  // Transmission reliability is managed on the application layer.
+  dataChannel = peerConnection.createDataChannel('pikavolley_p2p_channel', {
+    ordered: false,
+    maxRetransmits: 0,
+  });
+  dataChannel.addEventListener('open', dataChannelOpened);
+  dataChannel.addEventListener('message', recieveFromPeer);
+  dataChannel.addEventListener('close', dataChannelClosed);
+
+  const nonce = Math.random().toString(36).slice(2);
+  let offerSdp = null;
+  const publishOffer = () => {
+    if (offerSdp && signaling && !peerConnection.currentRemoteDescription) {
+      signaling.publish(
+        'offer',
+        { type: 'offer', sdp: offerSdp, nonce, ts: Date.now() },
+        true
+      );
+    }
+  };
+  signaling = new Signaling(roomId, {
+    willSubtopic: 'offer',
+    onConnect: publishOffer,
+  });
+  signaling.subscribe('answer', async (msg) => {
+    if (
+      msg.nonce !== nonce ||
+      !msg.sdp ||
+      peerConnection.currentRemoteDescription
+    ) {
+      return;
+    }
+    printLog('Answer received');
+    stopOfferRefresh();
+    // The room is taken now: remove the offer
+    signaling.publish('offer', null, true);
+    try {
+      await peerConnection.setRemoteDescription({
+        type: 'answer',
+        sdp: msg.sdp,
+      });
+    } catch (e) {
+      console.log('setRemoteDescription failed', e);
+      return;
+    }
+    const ip = partialPublicIPFromSdp(msg.sdp);
+    if (ip !== null) {
+      channel.peerPartialPublicIP = ip;
+    }
+  });
+
+  const offer = await peerConnection.createOffer();
+  await peerConnection.setLocalDescription(offer);
+  await waitIceGathering(peerConnection, iceGatherTimeout());
+  offerSdp = peerConnection.localDescription.sdp;
+  const myIP = partialPublicIPFromSdp(offerSdp);
+  if (myIP !== null) {
+    channel.myPartialPublicIP = myIP;
+  }
+
+  const connected = await signaling.ready(10000);
+  if (!connected) {
+    printLog('Could not reach the signaling servers');
     notifyBySound();
     printConnectionFailed();
     return;
   }
-  peer.on('connection', (conn) => {
-    if (peerDataConn) {
-      // The room is already joined by someone else
-      conn.on('open', () => conn.close());
-      return;
-    }
-    printLog('Peer joined');
-    adoptDataConnection(conn);
-    watchIceCandidates(conn.peerConnection);
-  });
+  publishOffer();
+  offerRefreshTimer = window.setInterval(publishOffer, OFFER_REFRESH_MS);
   console.log(`New room created. Room ID: ${roomId}`);
-  printLog('Room created');
+  printLog('Room created. Waiting for the peer...');
+}
+
+function stopOfferRefresh() {
+  if (offerRefreshTimer !== null) {
+    window.clearInterval(offerRefreshTimer);
+    offerRefreshTimer = null;
+  }
 }
 
 /**
@@ -308,42 +335,115 @@ export async function joinRoom(roomIdToJoin) {
     return false;
   }
   console.log('Join room: ', roomId);
-  try {
-    peer = await createPeer();
-  } catch (err) {
+
+  signaling = new Signaling(roomId);
+  const connected = await signaling.ready(10000);
+  if (!connected) {
+    printLog('Could not reach the signaling servers');
     notifyBySound();
     printConnectionFailed();
     return false;
   }
-  const conn = peer.connect(roomIdToPeerId(roomId), {
-    reliable: false,
-    serialization: 'raw',
-  });
-  if (!conn) {
-    printConnectionFailed();
+  const offerMsg = await signaling.waitFor(
+    'offer',
+    8000,
+    (msg) =>
+      msg &&
+      msg.type === 'offer' &&
+      typeof msg.sdp === 'string' &&
+      Math.abs(Date.now() - msg.ts) < OFFER_MAX_AGE_MS
+  );
+  if (offerMsg === null) {
+    console.log('No room is matching the ID');
+    printNoRoomMatchingMessage();
+    signaling.close();
+    signaling = null;
     return false;
   }
-  adoptDataConnection(conn);
-  watchIceCandidates(conn.peerConnection);
-  printLog('Connecting...');
+  printLog('Offer received');
+
+  console.log('Create PeerConnection with configuration: ', rtcConfiguration);
+  peerConnection = new RTCPeerConnection(rtcConfiguration);
+  registerPeerConnectionListeners(peerConnection);
+
+  await peerConnection.setRemoteDescription({
+    type: 'offer',
+    sdp: offerMsg.sdp,
+  });
+  const peerIP = partialPublicIPFromSdp(offerMsg.sdp);
+  if (peerIP !== null) {
+    channel.peerPartialPublicIP = peerIP;
+  }
+  const answer = await peerConnection.createAnswer();
+  await peerConnection.setLocalDescription(answer);
+  await waitIceGathering(peerConnection, iceGatherTimeout());
+  const answerSdp = peerConnection.localDescription.sdp;
+  const myIP = partialPublicIPFromSdp(answerSdp);
+  if (myIP !== null) {
+    channel.myPartialPublicIP = myIP;
+  }
+  signaling.publish(
+    'answer',
+    { type: 'answer', sdp: answerSdp, nonce: offerMsg.nonce },
+    false
+  );
+  printLog('Answer sent. Connecting...');
+
   setTimeout(() => {
     if (!isDataChannelEverOpened) {
       notifyBySound();
       printConnectionFailed();
     }
-  }, 20000);
+  }, 25000);
   return true;
 }
 
 /**
- * Clean up the signaling server connection.
- * (Name kept for compatibility. Signaling now uses the PeerJS server.)
+ * Send data only when the data channel is open
+ * @param {string|ArrayBuffer} data
  */
-export function cleanUpFirestoreRelevants() {
-  if (peer && !peer.destroyed) {
-    peer.disconnect();
+function safeSend(data) {
+  if (!dataChannel || dataChannel.readyState !== 'open') {
+    return;
+  }
+  try {
+    dataChannel.send(data);
+  } catch (e) {
+    console.log('send failed', e);
   }
 }
+
+/**
+ * Clean up the signaling server connection.
+ * (Name kept for compatibility. Signaling now uses MQTT brokers.)
+ */
+export function cleanUpFirestoreRelevants() {
+  stopOfferRefresh();
+  if (signaling) {
+    signaling.close(channel.amICreatedRoom ? ['offer'] : []);
+    signaling = null;
+  }
+}
+
+let wakeLock = null;
+
+/** Keep the screen on during the game (mobile) */
+async function requestWakeLock() {
+  try {
+    // @ts-ignore
+    if ('wakeLock' in navigator && document.visibilityState === 'visible') {
+      // @ts-ignore
+      wakeLock = await navigator.wakeLock.request('screen');
+    }
+  } catch (e) {
+    console.log('wake lock failed', e);
+  }
+}
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'visible' && channel.isOpen && !wakeLock) {
+    requestWakeLock();
+  }
+});
 
 export function closeConnection() {
   if (dataChannel) {
@@ -372,7 +472,7 @@ export function sendInputQueueToPeer(inputQueue) {
     const byte = convertUserInputTo5bitNumber(input);
     dataView.setUint8(2 + i, byte);
   }
-  dataChannel.send(buffer);
+  safeSend(buffer);
 }
 
 /**
@@ -423,9 +523,9 @@ export function sendChatMessageToPeer(chatMessage) {
   chatManager.pendingMessage = chatMessage;
   // append syncCounter at the end of chat message;
   const chatMessageToPeer = chatMessage + String(chatManager.syncCounter);
-  dataChannel.send(chatMessageToPeer);
+  safeSend(chatMessageToPeer);
   chatManager.resendIntervalID = setInterval(
-    () => dataChannel.send(chatMessageToPeer),
+    () => safeSend(chatMessageToPeer),
     1000
   );
   return;
@@ -499,7 +599,7 @@ function receiveChatMessageFromPeer(chatMessage) {
   const buffer = new ArrayBuffer(1);
   const dataView = new DataView(buffer);
   dataView.setInt8(0, peerSyncCounter);
-  dataChannel.send(buffer);
+  safeSend(buffer);
 }
 
 /**
@@ -516,9 +616,9 @@ export function sendOptionsChangeMessageToPeer(options) {
   let optionsChangeMessageToPeer = JSON.stringify(options);
   // append syncCounter at the end of options change message;
   optionsChangeMessageToPeer += String(optionsChangeManager.syncCounter);
-  dataChannel.send(optionsChangeMessageToPeer);
+  safeSend(optionsChangeMessageToPeer);
   optionsChangeManager.resendIntervalID = setInterval(
-    () => dataChannel.send(optionsChangeMessageToPeer),
+    () => safeSend(optionsChangeMessageToPeer),
     1000
   );
   return;
@@ -573,7 +673,7 @@ function receiveOptionsChangeMessageFromPeer(optionsChangeMessage) {
   const buffer = new ArrayBuffer(1);
   const dataView = new DataView(buffer);
   dataView.setInt8(0, peerSyncCounter);
-  dataChannel.send(buffer);
+  safeSend(buffer);
 }
 
 /**
@@ -583,9 +683,9 @@ function receiveOptionsChangeMessageFromPeer(optionsChangeMessage) {
 export function sendOptionsChangeAgreeMessageToPeer(agree) {
   let agreeMessageToPeer = String(agree);
   agreeMessageToPeer += String(optionsChangeAgreeManager.syncCounter);
-  dataChannel.send(agreeMessageToPeer);
+  safeSend(agreeMessageToPeer);
   optionsChangeAgreeManager.resendIntervalID = setInterval(
-    () => dataChannel.send(agreeMessageToPeer),
+    () => safeSend(agreeMessageToPeer),
     1000
   );
   return;
@@ -633,7 +733,7 @@ function receiveOptionsChangeAgreeMessageFromPeer(optionsChangeAgreeMessage) {
   const buffer = new ArrayBuffer(1);
   const dataView = new DataView(buffer);
   dataView.setInt8(0, peerSyncCounter);
-  dataChannel.send(buffer);
+  safeSend(buffer);
 }
 
 /**
@@ -643,9 +743,9 @@ function receiveOptionsChangeAgreeMessageFromPeer(optionsChangeAgreeMessage) {
 export function sendChatEnabledMessageToPeer(enabled) {
   let enabledMessageToPeer = String(enabled);
   enabledMessageToPeer += String(chatEnabledManager.syncCounter);
-  dataChannel.send(enabledMessageToPeer);
+  safeSend(enabledMessageToPeer);
   chatEnabledManager.resendIntervalID = setInterval(
-    () => dataChannel.send(enabledMessageToPeer),
+    () => safeSend(enabledMessageToPeer),
     1000
   );
   return;
@@ -692,7 +792,7 @@ function receiveChatEnabledMessageFromPeer(chatEnabledMessage) {
   const buffer = new ArrayBuffer(1);
   const dataView = new DataView(buffer);
   dataView.setInt8(0, peerSyncCounter);
-  dataChannel.send(buffer);
+  safeSend(buffer);
 }
 
 /**
@@ -702,9 +802,9 @@ function receiveChatEnabledMessageFromPeer(chatEnabledMessage) {
 export function sendPeerNicknameShownMessageToPeer(shown) {
   let shownMessageToPeer = String(shown);
   shownMessageToPeer += String(peerNicknameShownManager.syncCounter);
-  dataChannel.send(shownMessageToPeer);
+  safeSend(shownMessageToPeer);
   peerNicknameShownManager.resendIntervalID = setInterval(
-    () => dataChannel.send(shownMessageToPeer),
+    () => safeSend(shownMessageToPeer),
     1000
   );
   return;
@@ -751,7 +851,7 @@ function receivePeerNicknameShownMessageFromPeer(peerNicknameShownMessage) {
   const buffer = new ArrayBuffer(1);
   const dataView = new DataView(buffer);
   dataView.setInt8(0, peerSyncCounter);
-  dataChannel.send(buffer);
+  safeSend(buffer);
 }
 
 /**
@@ -800,7 +900,7 @@ function startGameAfterPingTest() {
       return;
     }
     pingTestManager.pingSentTimeArray[n] = Date.now();
-    dataChannel.send(buffer);
+    safeSend(buffer);
     printPeriodInLog();
     n++;
   }, 1000);
@@ -817,7 +917,7 @@ function respondToPingTest(data) {
     const view = new DataView(buffer);
     view.setInt8(0, -2);
     console.log('respond to ping');
-    dataChannel.send(buffer);
+    safeSend(buffer);
   } else if (dataView.getInt8(0) === -2) {
     pingTestManager.pingMesurementArray.push(
       Date.now() -
@@ -892,6 +992,7 @@ function dataChannelOpened() {
   cleanUpFirestoreRelevants();
   stopAdvertising();
   stopLobby();
+  requestWakeLock();
 
   if (channel.isQuickMatch) {
     disableCancelQuickMatchBtnForAWhile();
@@ -921,10 +1022,7 @@ function dataChannelClosed() {
   noticeDisconnected();
 }
 
-function registerPeerConnectionListeners(
-  peerConnection,
-  handleDataChannel = true
-) {
+function registerPeerConnectionListeners(peerConnection) {
   peerConnection.addEventListener('icegatheringstatechange', () => {
     console.log(
       `ICE gathering state changed: ${peerConnection.iceGatheringState}`
@@ -937,9 +1035,28 @@ function registerPeerConnectionListeners(
   peerConnection.addEventListener('connectionstatechange', () => {
     console.log(`Connection state change: ${peerConnection.connectionState}`);
     printLog(`Connection state change: ${peerConnection.connectionState}`);
-    if (
-      peerConnection.connectionState === 'disconnected' ||
-      peerConnection.connectionState === 'closed'
+    const state = peerConnection.connectionState;
+    if (state === 'connected') {
+      if (disconnectTimer !== null) {
+        // recovered from a temporary disconnection
+        window.clearTimeout(disconnectTimer);
+        disconnectTimer = null;
+      }
+      logSelectedCandidatePair(peerConnection);
+    } else if (state === 'disconnected' && isDataChannelEverOpened) {
+      // Mobile networks often recover by themselves. Wait a while.
+      if (disconnectTimer === null) {
+        disconnectTimer = window.setTimeout(() => {
+          disconnectTimer = null;
+          if (peerConnection.connectionState !== 'connected') {
+            channel.isOpen = false;
+            noticeDisconnected();
+          }
+        }, DISCONNECT_GRACE_MS);
+      }
+    } else if (
+      (state === 'closed' || state === 'failed') &&
+      isDataChannelEverOpened
     ) {
       channel.isOpen = false;
       noticeDisconnected();
@@ -967,9 +1084,6 @@ function registerPeerConnectionListeners(
     );
   });
 
-  if (!handleDataChannel) {
-    return;
-  }
   peerConnection.addEventListener('datachannel', (event) => {
     dataChannel = event.channel;
 

@@ -15,9 +15,9 @@ const ADVERTISE_INTERVAL = 8000;
 const STALE_MS = 25000;
 
 /** @return {string[]} */
-function getBrokers() {
+export function getBrokers() {
   const param = new URLSearchParams(window.location.search).get('mqtt');
-  return param ? [param] : DEFAULT_BROKERS;
+  return param ? param.split(',') : DEFAULT_BROKERS;
 }
 
 /** @type {Map<string, {nickname: string, ts: number, lastSeen: number}>} */
