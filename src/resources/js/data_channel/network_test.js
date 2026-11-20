@@ -1,6 +1,6 @@
 'use strict';
 import { parseCandidate } from './parse_candidate.js';
-import { rtcConfiguration } from './rtc_configuration.js';
+import { stunOnlyConfiguration } from './rtc_configuration.js';
 
 let peerConnection = null;
 let dataChannel = null;
@@ -16,7 +16,7 @@ export async function testNetwork(
   callBackIfDidNotGetSrflxAndHostAddressIsPrivateIPAddress,
   callBackIfBehindSymmetricNat
 ) {
-  peerConnection = new RTCPeerConnection(rtcConfiguration);
+   peerConnection = new RTCPeerConnection(stunOnlyConfiguration);
 
   let isHostAddressObfuscated = false;
   let isHostAddressPublicIP = false;
